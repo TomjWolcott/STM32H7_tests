@@ -17,6 +17,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+#include <main2.hpp>
 #include "main.h"
 #include "cmsis_os.h"
 #include "usb_device.h"
@@ -28,10 +29,18 @@
 #include "semphr.h"
 #include <stdint.h>
 #include "lookups.h"
+#include "system_conf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef struct {
+	int n;
+	float amplitude;
+	float phase;
+} MicDataAveraged;
+
 typedef struct {
 	SemaphoreHandle_t semaphore;
 	float cos_part;
@@ -39,13 +48,13 @@ typedef struct {
 	float amplitude;
 	float phase;
 	uint32_t time_taken_us;
+	MicDataAveraged avg;
 } MicData;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define MIC_BUF_LEN 2048
-uint16_t micBuffer[MIC_BUF_LEN];
+uint16_t micBuffer[MIC_BUFFER_LENGTH] = { 0 };
 MicData micData1;
 MicData micData2;
 /* USER CODE END PD */
@@ -164,6 +173,8 @@ int main(void)
 
   micData1.semaphore = xSemaphoreCreateMutex();
   micData2.semaphore = xSemaphoreCreateMutex();
+  micData1.avg.n = 0;
+  micData2.avg.n = 0;
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -501,10 +512,15 @@ void StartDefaultTask2(void *argument)
 {
   for(;;)
   {
+	  float phase_diff = 0.0f;
+	  float relative_amplitude = 0.0f;
+	  int total_time = 0;
       if (xSemaphoreTake(micData1.semaphore, (TickType_t)10) == pdTRUE) {
-    	  printf("\033[2J");
-          printf("Mic Data for 1480Hz: \r\r\n\r\r");
-          printf("  Amplitude: %.5f\r\r\n\r\r", micData1.amplitude);
+    	  phase_diff = micData1.phase;
+          relative_amplitude = micData1.amplitude;
+
+          total_time += micData1.time_taken_us;
+          printf("1760Hz: (%+.5f, %+.5f), ", micData1.amplitude, micData1.phase);
 //          printf("  cos: %.5f\r\r\n\r\r", micData1.cos_part);
 //          printf("  sin: %.5f\r\r\n\r\r", micData1.sin_part);
 
@@ -516,18 +532,23 @@ void StartDefaultTask2(void *argument)
       }
 
       if (xSemaphoreTake(micData2.semaphore, (TickType_t)10) == pdTRUE) {
-          printf("Mic Data for 880Hz: \r\r\n\r\r");
-          printf("  Amplitude: %.5f\r\r\n\r\r", micData2.amplitude);
+    	  phase_diff -= 2.0f * micData2.phase;
+    	  relative_amplitude -= micData2.amplitude;
+          total_time += micData2.time_taken_us;
+
+          printf("880Hz: (%+.5f, %+.5f), ", micData2.amplitude, micData2.phase);
 //          printf("  cos: %.5f\r\r\n\r\r", micData2.cos_part);
 //          printf("  sin: %.5f\r\r\n\r\r", micData2.sin_part);
-    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, !(micData2.amplitude > 0.0005));
+    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, !(micData2.amplitude > 0.0004));
 
           xSemaphoreGive(micData2.semaphore);
       } else {
           printf("MicData2 semaphore not available\r\n");
       }
+
+      printf("relative: (%+.5f, %+.5f), total_time: %d\r\n", relative_amplitude, phase_diff, total_time);
       fflush(stdout);
-      osDelay(20);
+      osDelay(50);
   }
   /* USER CODE END 5 */
 }
@@ -548,23 +569,36 @@ int micAvg = 0;
 
 void updateMicDataWithParts(MicData *mic_data, int64_t cos_part_int, int64_t sin_part_int, uint32_t time_taken_us) {
 	xSemaphoreTake(mic_data->semaphore, portMAX_DELAY);
-	mic_data->cos_part = 2.0 * (float)cos_part_int / ((float)MIC_BUF_LEN * 2147483647.0);
-	mic_data->sin_part = 2.0 * (float)sin_part_int / ((float)MIC_BUF_LEN * 2147483647.0);
+	mic_data->cos_part = 2.0 * (float)cos_part_int / ((float)MIC_BUFFER_LENGTH * 2147483647.0);
+	mic_data->sin_part = 2.0 * (float)sin_part_int / ((float)MIC_BUFFER_LENGTH * 2147483647.0);
 	mic_data->amplitude = sqrt(mic_data->cos_part * mic_data->cos_part + mic_data->sin_part * mic_data->sin_part);
 	mic_data->phase = atan2(mic_data->sin_part, mic_data->cos_part);
 	mic_data->time_taken_us = time_taken_us;
+
+	if (mic_data->avg.n == 0) {
+		mic_data->avg.amplitude = mic_data->amplitude;
+		mic_data->avg.phase = mic_data->phase;
+	} else {
+		mic_data->avg.amplitude = (mic_data->amplitude + mic_data->avg.n * mic_data->avg.amplitude) / (mic_data->avg.n + 1);
+//		float total_phase = (mic_data->amplitude + mic_data->avg.n * mic_data->avg.amplitude);
+//		total_phase = (total_phase + 4.0f * M_PI) % (4.0f * M_PI);
+		mic_data->avg.phase = (mic_data->amplitude + mic_data->avg.n * mic_data->avg.amplitude) / (mic_data->avg.n + 1);
+	}
+	mic_data->avg.n += 1;
+
 	xSemaphoreGive(mic_data->semaphore);
 }
 
 void updateMicDataForFreq(MicData *mic_data, int index_offset, int freq) {
 	int64_t cos_part_int = 0;
 	int64_t sin_part_int = 0;
+	uint32_t time = HAL_GetTick();
 
 	int phi_cos = LOOKUP_TABLE_SIZE / 4;
 	int phi_sin = 0;
 	int dphi = ((ADC_PICKER_PERIOD_us * LOOKUP_TABLE_SIZE * freq) / 1000000) & LOOKUP_MASK;
 
-	for (int i = 0; i < MIC_BUF_LEN / 2; i++) {
+	for (int i = 0; i < MIC_BUFFER_LENGTH / 2; i++) {
 		int16_t adc_value = micBuffer[i + index_offset] - micAvg;
 		phi_cos = (phi_cos + dphi) & LOOKUP_MASK;
 		phi_sin = (phi_sin + dphi) & LOOKUP_MASK;
@@ -573,24 +607,26 @@ void updateMicDataForFreq(MicData *mic_data, int index_offset, int freq) {
 		sin_part_int += (adc_value * sineLookupTable4096[phi_sin]);
 	}
 
-	updateMicDataWithParts(mic_data, cos_part_int, sin_part_int, 0);
+	time = HAL_GetTick() - time;
+
+	updateMicDataWithParts(mic_data, cos_part_int, sin_part_int, 1000 * time);
 }
 
 void getMicDataAvg() {
 	int64_t avg = 0;
 
-	for (int i = 0; i < MIC_BUF_LEN / 2; i++) {
-		avg += (int64_t)(micBuffer[i + MIC_BUF_LEN / 2]);
+	for (int i = 0; i < MIC_BUFFER_LENGTH / 2; i++) {
+		avg += (int64_t)(micBuffer[i + MIC_BUFFER_LENGTH / 2]);
 	}
 
-	micAvg = 2 * avg / MIC_BUF_LEN;
+	micAvg = 2 * avg / MIC_BUFFER_LENGTH;
 }
 
 void HandleMicBuffer(void *argument) {
 	xMicDataTask = xTaskGetCurrentTaskHandle();
 
 	uint32_t notifiedValue;
-	HAL_ADC_Start_DMA(&hadc2, (uint32_t*)micBuffer, MIC_BUF_LEN);
+	HAL_ADC_Start_DMA(&hadc2, (uint32_t*)micBuffer, MIC_BUFFER_LENGTH);
 	HAL_TIM_Base_Start(&htim3);
 
 
@@ -598,7 +634,7 @@ void HandleMicBuffer(void *argument) {
 		BaseType_t xResult = xTaskNotifyWait( pdFALSE, UINT32_MAX, &notifiedValue, portMAX_DELAY);
 
 		if (xResult == pdPASS && notifiedValue == HALF_CONVERT) {
-			updateMicDataForFreq(&micData1, 0, 1480);
+			updateMicDataForFreq(&micData1, 0, 1760);
 			updateMicDataForFreq(&micData2, 0, 880);
 		} else if (xResult == pdPASS && notifiedValue == FULL_CONVERT) {
 			getMicDataAvg();
